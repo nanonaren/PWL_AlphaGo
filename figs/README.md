@@ -1,1 +1,3 @@
 # figs
+
+Install using stack

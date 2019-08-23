@@ -17,6 +17,7 @@ import           Debug.Trace
 import           Diagrams.Backend.Rasterific
 import           Diagrams.Prelude
 import           Diagrams.TwoD.Layout.Tree
+import           System.Directory (getCurrentDirectory)
 import           System.Random.MWC
 import           System.Random.MWC.Distributions (uniformShuffle, categorical)
 import           Text.Printf (printf)
@@ -64,6 +65,11 @@ data MM g = MM
     game :: g
   , best :: Int
   }
+
+drawMMTree :: Game g => Tree (MM g) -> Diagram B
+drawMMTree = renderTree f (~~) . symmLayout' (with & slHSep .~ 6 & slVSep .~ 5)
+  where f x = (text (show (best x)) # fontSize (local 0.5)
+           <> square 1 # fc cyan) === strutY 0.1 === draw (game x)
 
 minimax :: Game g => Tree g -> [Tree (MM g)]
 minimax root = snd $ evalRWS (go root True) () (Z.fromTree $ fmap (\t -> MM t 0) root)
@@ -196,7 +202,57 @@ instance Game GreedyCoins where
   scores = total
 
 ----------------------------------------------------------------------
+-- MCTS: Vanilla
+--
+-- Note: select should be a draw from distribution but using max here
+-- since select is pure.
+----------------------------------------------------------------------
+
+data Vanilla g = Vanilla
+  {
+    vPayout :: Double
+  , vCurPayout :: Double
+  , vVisits :: Double
+  , vState :: g
+  } deriving (Eq, Show)
+
+instance Game g => MCTS (Vanilla g) where
+  select xs = if all_visited then (i, node, d) else (rand, rand_node, rand_d)
+    where all_visited = all ((> 0) . vVisits) xs
+          rand = fst . head . filter ((==0) . vVisits . snd) $ zip [0..] xs
+          rand_node = xs !! rand
+          i = fst . maximumBy (comparing snd)
+            . zipWith (\i x -> (i, vPayout x / vVisits x)) [0..] $ xs
+          node = xs !! i
+          d = text ("Selection: arg max {" ++ intercalate ", " (map f xs) ++ "}") # fontSizeL 0.5
+          f x = printf "%f" (vPayout x / vVisits x)
+          rand_d = text "Selection: picking unvisited"
+
+  rollout x player1 =
+    let xs = [(Vanilla 0 0 0 g, 1) | g <- next (vState x) player1]
+        d = text ("Expansion: draw ~ " ++ intercalate ", " (replicate (length xs) "1")) # fontSizeL 0.5
+    in (xs, id, d)
+
+  backup Nothing x = (x', d)
+    where d = text ("Evaluation: Payout = " ++ show (vCurPayout x')) # fontSizeL 0.5
+          s = fromIntegral $ fst (scores (vState x))
+          x' = x{vCurPayout = s,
+                 vPayout = s,
+                 vVisits = vVisits x + 1}
+  backup (Just y) x = (x', d)
+    where d = text ("Backup: Accumulated Payout = " ++ show (vPayout x) ++ " + " ++ show (vCurPayout y)) # fontSizeL 0.5
+          x' = x{vPayout = vPayout x + vCurPayout y,
+                 vCurPayout = vCurPayout y,
+                 vVisits = vVisits x + 1}
+
+  drawNode x = vsep 0.3 [
+    text (printf "N=%0.0f; P=%0.2f" (vVisits x) (vPayout x / vVisits x)) # fontSizeL 0.3 <>
+    rect 4 0.5 # fc lightgray # lwL 0.01,
+    draw (vState x)]
+
+----------------------------------------------------------------------
 -- MCTS: Upper Confidence Trees
+--
 ----------------------------------------------------------------------
 
 data UCT g = UCT
@@ -339,25 +395,52 @@ instance MCTS (AlphaGoStyle GreedyCoins) where
     rect 7 0.5 # fc lightgray # lwL 0.01,
     draw (goState x)]
 
-{-
-How do you generate copies of the tree at each step?
-The answer can only be with a zipper
--}
+----------------------------------------------------------------------
+-- Misc
+--
+----------------------------------------------------------------------
 
 drawGameTree :: Game g => Tree g -> Diagram B
-drawGameTree = renderTree draw (~~) . forceLayoutTree . symmLayout' (with & slHSep .~ 6 & slVSep .~ 3)
-
-drawMMTree :: Game g => Tree (MM g) -> Diagram B
-drawMMTree = renderTree f (~~) . symmLayout' (with & slHSep .~ 6 & slVSep .~ 5)
-  where f x = (text (show (best x)) # fontSize (local 0.5) `atop` square 1 # fc cyan) === strutY 0.1 === draw (game x)
+drawGameTree = renderTree draw (~~) . symmLayout' (with & slHSep .~ 6 & slVSep .~ 3)
 
 main :: IO ()
 main = do
   let g = GreedyCoins [10,3,1,2,7] (0, 0)
+  dir <- getCurrentDirectory
+
+  -- One game
+  let play g (player1, i) = [Node (next g player1 !! i) []]
+      z = foldl (\z i ->
+                   fromJust $
+                   Z.childAt 0 (Z.modifyTree (\n -> n{subForest = play (rootLabel n) i}) z)
+                ) (Z.fromTree $ Node g []) (zip (cycle [True,False]) [0,1,0,1,0])
+  renderRasterific (printf "%s/examples/one.pdf" dir) (dims2D 100 200) $
+    drawGameTree (Z.toTree z)
+
+  -- Full Game Tree
+  renderRasterific (printf "%s/examples/full.pdf" dir) (dims2D 1500 500) $
+    drawGameTree (fullGameTree g)
+
+  -- Minimax
+  forM_ (zip [(0::Int)..] $ minimax (fullGameTree g)) $ \(i,t) ->
+    renderRasterific (printf "%s/examples/minimax/%d.pdf" dir i) (dims2D 1500 1500) (drawMMTree t)
+
+  -- Vanilla
+  drawMCTS (Vanilla{vPayout=0,
+                    vCurPayout=0,
+                    vVisits=0,
+                    vState=g}) 1000 1500 (dir ++ "/examples/vanilla") 3
+
+  -- UCT
+  drawMCTS (UCT{uctPayout=0,
+                curPayout=0,
+                uctVisits=0,
+                uctState=g}) 1000 1500 (dir ++ "/examples/uct") 3
+
+  -- AlphaGo
   drawMCTS (AlphaGoStyle{goPrior=0,
                          goCurPayout=0,
                          goPayout=0,
                          goVisits=0,
                          goPred=0,
-                         goState=g}) 1000 1500 "/home/naren/Desktop/go" 2
-  -- renderRasterific "example.pdf" (dims2D 1000 1000) (drawMMTree . (!! 0) . minimax $ t)
+                         goState=g}) 1000 1500 (dir ++ "/examples/alphago") 3
