@@ -3,48 +3,92 @@
 
 module Main where
 
-import Debug.Trace
-import Data.Tree
-import Diagrams.Prelude
-import Diagrams.Backend.Rasterific
-import Diagrams.TwoD.Layout.Tree
+import           Control.Monad (zipWithM, when, forM_, foldM_)
+import           Control.Monad.IO.Class (liftIO)
+import           Control.Monad.Trans.RWS.Lazy hiding (local)
+import           Data.List (maximumBy, intercalate)
+import           Data.Maybe (fromJust)
+import           Data.Ord (comparing)
+import           Data.Tree
 import qualified Data.Tree.Zipper as Z
-import Control.Monad (zipWithM, when, forM_, foldM_)
-import Control.Monad.IO.Class (liftIO)
-import Control.Monad.Trans.RWS.Lazy hiding (local)
-import Data.Maybe (fromJust)
-import System.Random.MWC
-import System.Random.MWC.Distributions (uniformShuffle, categorical)
 import qualified Data.Vector as V
-import Data.Ord (comparing)
-import Data.List (maximumBy, intercalate)
-import Text.Printf (printf)
+import           Debug.Trace
+import           Diagrams.Backend.Rasterific
+import           Diagrams.Prelude
+import           Diagrams.TwoD.Layout.Tree
+import           System.Random.MWC
+import           System.Random.MWC.Distributions (uniformShuffle, categorical)
+import           Text.Printf (printf)
 
-data GreedyCoins = GreedyCoins
-  {
-    board :: [Int]
-  , total :: (Int, Int)
-  } deriving (Eq, Show)
+----------------------------------------------------------------------
+-- Abstraction for a two-player game
+--
+----------------------------------------------------------------------
 
 class Game a where
   draw :: a -> Diagram B
   next :: a -> Bool -> [a]
   scores :: a -> (Int, Int)
 
-instance Game GreedyCoins where
-  draw g =
-    let coin n = text (show n) <> circle 1 # fc yellow
-    in vsep 0.1 $ map centerX [
-      ((text $ (show . fst $ total g) ++ " : " ++ (show . snd $ total g)) # fontSize (local 0.5) `atop` rect 3 0.8 # fc grey),
-      hcat (map coin (board g))]
-  next g player1
-    | null (board g) = []
-    | null (tail (board g)) = [g{board = tail (board g), total = playerScore (head (board g))}]
-    | otherwise = [g{board = tail (board g), total = playerScore (head (board g))},
-                   g{board = init (board g), total = playerScore (last (board g))}]
-    where playerScore x = if player1 then (a + x, b) else (a, b + x)
-          (a, b) = total g
-  scores = total
+----------------------------------------------------------------------
+-- Generating a Full or Random game tree
+--
+----------------------------------------------------------------------
+
+fullGameTree :: Game g => g -> Tree g
+fullGameTree g = unfoldTree (
+  \(g, player1) -> (g, map (, not player1) $ next g player1)) (g, True)
+
+-- Generate full game tree and randomly select some leaves
+-- prune the rest
+randomGameTree :: Game g => g -> IO (Tree g)
+randomGameTree g = withSystemRandom $ \gen -> unfoldTreeM (f gen) (g, True)
+  where f gen (g, player1) = do
+          let children = next g player1
+          if null children
+            then return (g, [])
+            else do
+              let childv = V.fromList children
+              i <- asGenIO (uniformR (1, V.length childv)) gen
+              cs <- uniformShuffle childv gen
+              return (g, map (, not player1) $ take i (V.toList cs))
+
+----------------------------------------------------------------------
+-- Abstracted Minimax
+--
+----------------------------------------------------------------------
+
+data MM g = MM
+  {
+    game :: g
+  , best :: Int
+  }
+
+minimax :: Game g => Tree g -> [Tree (MM g)]
+minimax root = snd $ evalRWS (go root True) () (Z.fromTree $ fmap (\t -> MM t 0) root)
+  where go t player1
+          | null (subForest t) = do
+              -- set the best score
+              let (p1,p2) = scores . rootLabel $ t
+              setScoreAndReport $ if not player1 then p1 else p2
+          | otherwise = do
+              ss <- zipWithM (\i t -> do
+                                 modify (fromJust . Z.childAt i)
+                                 res <- go t (not player1)
+                                 modify (fromJust . Z.parent)
+                                 return res
+                             ) [0..] (subForest t)
+              setScoreAndReport $ if player1 then maximum ss else minimum ss
+        setScoreAndReport :: Int -> RWS () [Tree (MM g)] (Z.TreePos Z.Full (MM g)) Int
+        setScoreAndReport s = do
+          modify (Z.modifyTree (\x@Node{rootLabel=r} -> x{rootLabel = r{best=s}}))
+          get >>= tell . (:[]) . Z.toTree
+          return s
+
+----------------------------------------------------------------------
+-- Abstracted Monte Carlo Tree Search
+--
+----------------------------------------------------------------------
 
 class MCTS a where
     select :: [a] -> (Int, a, Diagram B)
@@ -52,7 +96,8 @@ class MCTS a where
     backup :: Maybe a -> a -> (a, Diagram B)
     drawNode :: a -> Diagram B
 
-drawMCTS :: (Show a, Eq a, MCTS a) => a -> Double -> Double -> FilePath -> Int -> IO ()
+drawMCTS :: (Show a, Eq a, MCTS a)
+         => a -> Double -> Double -> FilePath -> Int -> IO ()
 drawMCTS m sx sy dir niter = withSystemRandom $ \gen -> do
   (\f -> foldM_ f (Z.fromTree $ Node m []) [1..niter]) $ \z i -> do
     (z, ds) <- execRWST mcts gen z
@@ -65,7 +110,8 @@ drawMCTS m sx sy dir niter = withSystemRandom $ \gen -> do
         strutY 1
     return z
 
-mcts :: (Show a, Eq a, MCTS a) => RWST GenIO [(String, Diagram B)] (Z.TreePos Z.Full a) IO ()
+mcts :: (Show a, Eq a, MCTS a)
+     => RWST GenIO [(String, Diagram B)] (Z.TreePos Z.Full a) IO ()
 mcts = do
   d <- selection (0 :: Int)
   expansion d
@@ -118,11 +164,35 @@ mcts = do
                             else drawNode t) (~~) .
           symmLayout' (with & slHSep .~ 10 & slVSep .~ 5)
 
--- select till no children
--- @no children, set vL, run simulate
--- end of simulate, set zL
--- on unwind set for each node V(sL), N, etc
--- mcts :: Game g => Tree g -> IO [Tree (MCTS g)]
+----------------------------------------------------------------------
+-- Greedy-coins game
+--
+----------------------------------------------------------------------
+
+data GreedyCoins = GreedyCoins
+  {
+    board :: [Int]
+  , total :: (Int, Int)
+  } deriving (Eq, Show)
+
+instance Game GreedyCoins where
+  draw g =
+    let coin n = text (show n) <> circle 1 # fc yellow
+    in vsep 0.1 $ map centerX [
+      ((text $ (show . fst $ total g) ++ " : " ++ (show . snd $ total g)) # fontSize (local 0.5) `atop` rect 3 0.8 # fc grey),
+      hcat (map coin (board g))]
+  next g player1
+    | null (board g) = []
+    | null (tail (board g)) = [g{board = tail (board g), total = playerScore (head (board g))}]
+    | otherwise = [g{board = tail (board g), total = playerScore (head (board g))},
+                   g{board = init (board g), total = playerScore (last (board g))}]
+    where playerScore x = if player1 then (a + x, b) else (a, b + x)
+          (a, b) = total g
+  scores = total
+
+----------------------------------------------------------------------
+-- MCTS: Upper Confidence Trees
+----------------------------------------------------------------------
 
 data UCT g = UCT
   {
@@ -170,11 +240,12 @@ instance Game g => MCTS (UCT g) where
     rect 4 0.5 # fc lightgray # lwL 0.01,
     draw (uctState x)]
 
-data AlphaGoStyle = AlphaGoStyle
-  {
-    prior :: Double
-  , pred :: Double
-  }
+-- data AlphaGoStyle = AlphaGoStyle
+--   {
+--     prior :: Double
+--   , pred :: Double
+--   , 
+--   }
 
 -- drawInfo :: Game g => Info g -> Diagram B
 -- drawInfo x =
@@ -207,54 +278,10 @@ data AlphaGoStyle = AlphaGoStyle
 
 -- play :: st ->
 
-fullGameTree :: Game g => g -> Tree g
-fullGameTree g = unfoldTree (\(g, player1) -> (g, map (, not player1) $ next g player1)) (g, True)
-
--- Generate full game tree and randomly select some leaves
--- prune the rest
-randomGameTree :: Game g => g -> IO (Tree g)
-randomGameTree g = withSystemRandom $ \gen -> unfoldTreeM (f gen) (g, True)
-  where f gen (g, player1) = do
-          let children = next g player1
-          if null children
-            then return (g, [])
-            else do
-              let childv = V.fromList children
-              i <- asGenIO (uniformR (1, V.length childv)) gen
-              cs <- uniformShuffle childv gen
-              return (g, map (, not player1) $ take i (V.toList cs))
-
 {-
 How do you generate copies of the tree at each step?
 The answer can only be with a zipper
 -}
-
-data MM g = MM
-  {
-    game :: g
-  , best :: Int
-  }
-
-minimax :: Game g => Tree g -> [Tree (MM g)]
-minimax root = snd $ evalRWS (go root True) () (Z.fromTree $ fmap (\t -> MM t 0) root)
-  where go t player1
-          | null (subForest t) = do
-              -- set the best score
-              let (p1,p2) = scores . rootLabel $ t
-              setScoreAndReport $ if not player1 then p1 else p2
-          | otherwise = do
-              ss <- zipWithM (\i t -> do
-                                 modify (fromJust . Z.childAt i)
-                                 res <- go t (not player1)
-                                 modify (fromJust . Z.parent)
-                                 return res
-                             ) [0..] (subForest t)
-              setScoreAndReport $ if player1 then maximum ss else minimum ss
-        setScoreAndReport :: Int -> RWS () [Tree (MM g)] (Z.TreePos Z.Full (MM g)) Int
-        setScoreAndReport s = do
-          modify (Z.modifyTree (\x@Node{rootLabel=r} -> x{rootLabel = r{best=s}}))
-          get >>= tell . (:[]) . Z.toTree
-          return s
 
 drawGameTree :: Game g => Tree g -> Diagram B
 drawGameTree = renderTree draw (~~) . forceLayoutTree . symmLayout' (with & slHSep .~ 6 & slVSep .~ 3)
