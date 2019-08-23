@@ -1,5 +1,6 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE FlexibleInstances #-}
 
 module Main where
 
@@ -92,7 +93,8 @@ minimax root = snd $ evalRWS (go root True) () (Z.fromTree $ fmap (\t -> MM t 0)
 
 class MCTS a where
     select :: [a] -> (Int, a, Diagram B)
-    rollout :: a -> Bool -> ([(a, Double)], Diagram B)
+    -- | second pos of tuple is a function that will be applied to selected node
+    rollout :: a -> Bool -> ([(a, Double)], a -> a, Diagram B)
     backup :: Maybe a -> a -> (a, Diagram B)
     drawNode :: a -> Diagram B
 
@@ -133,15 +135,18 @@ mcts = do
 
         expansion depth = do
           t <- gets Z.tree
-          let (xs, d) = rollout (rootLabel t) (even depth)
+          let (xs, func, d) = rollout (rootLabel t) (even depth)
               (nodes, weights) = unzip xs
           when (not (null xs)) $ do
             modify (Z.modifyTree (\x -> x{subForest = map (\n -> Node n []) nodes}))
+            traceShowM ("weights", weights)
             i <- ask >>= liftIO . categorical (V.fromList weights)
             -- print diagram
-            dt <- gets (drawMCTSTree (nodes !! i) . Z.toTree)
+            let chosen = func (nodes !! i)
+            traceShowM ("chosen", chosen)
+            modify (Z.setLabel chosen . fromJust . Z.childAt i)
+            dt <- gets (drawMCTSTree chosen . Z.toTree)
             tell [(printf "A%03d" depth, vsep 1 [d, dt])]
-            modify (fromJust . Z.childAt i)
             expansion (depth+1)
 
         backpropogate depth prev = do
@@ -221,7 +226,7 @@ instance Game g => MCTS (UCT g) where
   rollout x player1 =
     let xs = [(UCT 0 0 0 g, 1) | g <- next (uctState x) player1]
         d = text ("Expansion: draw ~ " ++ intercalate ", " (replicate (length xs) "1")) # fontSizeL 0.5
-    in (xs, d)
+    in (xs, id, d)
 
   backup Nothing x = (x', d)
     where d = text ("Evaluation: Payout = " ++ show (curPayout x')) # fontSizeL 0.5
@@ -240,43 +245,99 @@ instance Game g => MCTS (UCT g) where
     rect 4 0.5 # fc lightgray # lwL 0.01,
     draw (uctState x)]
 
--- data AlphaGoStyle = AlphaGoStyle
---   {
---     prior :: Double
---   , pred :: Double
---   , 
---   }
+----------------------------------------------------------------------
+-- MCTS: Alpha Go Style
+--
+-- Allows selection priors
+-- Can use a heavy rollout
+-- Uses value prediction to combine with actual value
+----------------------------------------------------------------------
 
--- drawInfo :: Game g => Info g -> Diagram B
--- drawInfo x =
---   where n = text $ "N=" ++ show (visitCount x)
---         p = text $ "P=" ++ show (priorProb x)
+data AlphaGoStyle g = AlphaGoStyle
+  {
+    goPrior :: Double
+  , goCurPayout :: Double
+  , goPayout :: Double
+  , goVisits :: Double
+  , goPred :: Double
+  , goState :: g
+  } deriving (Eq, Show)
 
--- we pick the node that is visited the most number of times. Because
--- nodes are picked by maximizing the action value + prior. Suppose
--- there is no prior and the action value is purely based on zL, then
--- this reduces to picking the move that maximizes the number of wins.
+----------------------------------------------------------------------
+-- MCTS: Alpho Go Style applied to GreedyCoints
+--
+-- heuristic used for fast-rollout, value pred and policy network is
+-- prortional to cur_score + total of remaining board (-one coin)
+----------------------------------------------------------------------
 
--- data Phase = Selection | Expansion | Evaluation | Backup
+greedycoins_action_prob gs player1 = map (/sum totals) totals
+  where totals = map (\g -> fromIntegral $
+                       (if player1 then fst (scores g) else snd (scores g)) + remaining_board g
+                     ) gs
 
--- type GameTree st = Tree (Info st)
+remaining_board g | null (board g) = sum (board g)
+                  | otherwise = sum (board g) - max (head (board g)) (last (board g))
 
--- minimax :: 
+value_prob g player1 = fromIntegral numer / fromIntegral (p1 + p2 + sum (board g))
+  where numer = (if player1 then p1 else p2) + remaining_board g
+        (p1, p2) = scores g
 
--- Each node of the tree should display:
--- 1. N = count
--- 2. prior = value
--- 3. Q
+instance MCTS (AlphaGoStyle GreedyCoins) where
+  select xs = if all_visited then (i, node, d) else (rand, rand_node, rand_d)
+    where all_visited = all ((>0) . goVisits) xs
+          rand = fst . head . filter ((==0) . goVisits . snd) $ zip [0..] xs
+          rand_node = xs !! rand
+          discountedPriors = map (\x -> goPrior x / (1 + goVisits x)) xs
+          probPriors = map (/sum discountedPriors) discountedPriors
+          meanPayouts = map (\x -> goPayout x / goVisits x) xs
+          i = fst . maximumBy (comparing snd) $ zip [0..] $ zipWith (+) probPriors meanPayouts
+          node = xs !! i
+          d = text ("Selection: arg max {" ++
+                    intercalate ", " (zipWith (\a b -> show a ++ "+" ++ show b) meanPayouts probPriors)
+                   ) # fontSizeL 0.5
+          rand_d = text "Selection: picking unvisited"
 
--- During a simulation, render the following
--- 1. iter = count
--- 2. highlight leaf node
--- 3. zL = undefined till reach the end
--- 4. vL = undefined till leaf reached
+  rollout x player1 =
+    let gs = next (goState x) player1
+        action_probs = greedycoins_action_prob gs player1
+        d = text ("Expansion: draw ~ " ++ intercalate ", " (map (printf "%.2f") action_probs)) # fontSizeL 0.5
+        set_pred_value y = y{goPred = if goPred x == 0
+                                      then value_prob (goState x) player1
+                                      else goPred x}
+    in (zipWith (\g p -> (AlphaGoStyle{goPred=0,
+                                       goPrior=p,
+                                       goState=g,
+                                       goVisits=0,
+                                       goCurPayout=0,
+                                       goPayout=0}, p)) gs action_probs, set_pred_value, d)
 
--- render :: Tree (Info st) -> 
+  backup Nothing x = (x', d)
+    where d = text (printf "Evaluation: L=0.3; Payout=%.3f*L * (1-L)*%0.3f"
+                    (goPred x) s) # fontSizeL 0.5
+          p1 = fromIntegral (fst (scores (goState x)))
+          p2 = fromIntegral (snd (scores (goState x)))
+          s | p1 > p2 = 1
+            | otherwise = 0
+          val = goPred x * 0.3 + s * 0.7
+          x' = x{goCurPayout = val,
+                 goPred = 0,
+                 goPayout = val,
+                 goVisits = goVisits x + 1}
+  backup (Just y) x = (x', d)
+    where d = text ("Backup: Accumulated Payout = " ++
+                    show (goPayout x) ++ " + " ++
+                    show (goCurPayout y)) # fontSizeL 0.5
+          x' = x{goPayout = goPayout x + goCurPayout y,
+                 goCurPayout = goCurPayout y,
+                 goPred = 0,
+                 goVisits = goVisits x + 1}
 
--- play :: st ->
+  drawNode x = vsep 0.3 [
+    text (printf "N=%0.0f; P=%0.2f; Prior=%0.2f; v(sL)=%0.2f"
+          (goVisits x) (goPayout x / goVisits x) (goPrior x) (goPred x)
+         ) # fontSizeL 0.3 <>
+    rect 7 0.5 # fc lightgray # lwL 0.01,
+    draw (goState x)]
 
 {-
 How do you generate copies of the tree at each step?
@@ -293,5 +354,10 @@ drawMMTree = renderTree f (~~) . symmLayout' (with & slHSep .~ 6 & slVSep .~ 5)
 main :: IO ()
 main = do
   let g = GreedyCoins [10,3,1,2,7] (0, 0)
-  drawMCTS (UCT 0 0 0 g) 1000 1500 "/home/naren/Desktop/uct" 3
+  drawMCTS (AlphaGoStyle{goPrior=0,
+                         goCurPayout=0,
+                         goPayout=0,
+                         goVisits=0,
+                         goPred=0,
+                         goState=g}) 1000 1500 "/home/naren/Desktop/go" 2
   -- renderRasterific "example.pdf" (dims2D 1000 1000) (drawMMTree . (!! 0) . minimax $ t)
