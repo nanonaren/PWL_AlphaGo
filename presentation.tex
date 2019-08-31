@@ -160,13 +160,13 @@
   \begin{itemize}
   \item Below is a possible method for solving for $P^*(a | s)$.
     \pause
-  \item Starting at board $s$, play one game, $G_a$ for each possible first move $a \in A(s)$ followed by random moves till the end.
+  \item Starting at board $s$, play a few games, $\{G_a^1, G_a^2, \dots, G_a^k\}$ for each possible first move $a \in A(s)$ followed by random moves till the end.
   \pause
-  \item Suppose one of the games has the moves $a_1, \dots, a_N$. This gives us an estimate, $P_e(\text{win} | a, s)$ for $P(\text{win} | a, s)$ since
+  \item We can use the result of these games to give us an estimate for the probability of winning if we start with move $a$, $P_e(\text{win} | a, s)$ since
   \end{itemize}
   \pause
   \begin{displaymath}
-    P_e(\text{win} | a, s) = \frac{\text{isWin}(G_a)}{\sum_{a \in A(s)} \text{isWin}(G_a)}
+    P_e(\text{win} | a, s) = \frac{1}{k}\sum_{i=1}^k \text{isWin}(G_a^i)
   \end{displaymath}
   \begin{itemize}
   \item Now that we have $P(\text{win} | a, s)$ for $a \in A(s)$, we can estimate $P(a | s)$ using the formula for $P^*(a | s)$.
